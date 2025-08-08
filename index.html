@@ -1,0 +1,518 @@
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Trophy, Pause, Play, RotateCcw, Volume2, VolumeX, Settings, Sparkles } from "lucide-react";
+
+// Flappy Bird — "Awe" Edition (React + Canvas)
+// ✦ Parallax neon sky, soft shadows, particles, glass HUD, animated modals
+// Controls: Space / Click / Touch to flap, P to pause, R to restart
+
+export default function FlappyBirdAwe() {
+  const canvasRef = useRef(null);
+  const rafRef = useRef(null);
+  const lastTimeRef = useRef(0);
+  const spawnRef = useRef(0);
+
+  const [state, setState] = useState("ready"); // ready | playing | paused | gameover
+  const [score, setScore] = useState(0);
+  const [best, setBest] = useState(() => {
+    const saved = localStorage.getItem("flappy-best");
+    return saved ? parseInt(saved, 10) : 0;
+  });
+  const [soundOn, setSoundOn] = useState(true);
+  const [difficulty, setDifficulty] = useState(1); // 0.8 easy, 1 normal, 1.2 hard
+  const [theme, setTheme] = useState("neon"); // neon | dusk | mint
+
+  // Game constants (base values — scaled by difficulty)
+  const W = 460; // canvas width
+  const H = 760; // canvas height
+  const GROUND_H = 110;
+  const BASE_GRAVITY = 1600; // px/s^2
+  const BASE_FLAP = -460; // px/s impulse
+  const BASE_PIPE_SPEED = 156; // px/s
+  const BASE_PIPE_GAP = 168; // px
+  const PIPE_W = 74; // px
+  const BASE_SPAWN_MS = 1450; // ms
+  const BIRD_X = 132; // px
+  const BIRD_R = 16; // px
+
+  // Derived by difficulty
+  const GRAVITY = BASE_GRAVITY * difficulty;
+  const FLAP = BASE_FLAP * Math.sqrt(difficulty);
+  const PIPE_SPEED = BASE_PIPE_SPEED * difficulty;
+  const PIPE_GAP = Math.max(130, BASE_PIPE_GAP / difficulty);
+  const SPAWN_MS = Math.max(950, BASE_SPAWN_MS / difficulty);
+
+  // Mutable game objects
+  const birdRef = useRef({ y: H / 2, v: 0, rot: 0 });
+  const pipesRef = useRef([]); // { x, gapY, passed }
+  const particlesRef = useRef([]); // flap/collision particles
+  const cloudsRef = useRef([]); // parallax clouds
+
+  // --- Audio (very lightweight beeps via WebAudio) ------------------
+  const audioCtxRef = useRef(null);
+  const beep = useCallback((freq = 880, dur = 0.07, type = "sine") => {
+    if (!soundOn) return;
+    try {
+      if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = audioCtxRef.current;
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = type;
+      o.frequency.value = freq;
+      o.connect(g);
+      g.connect(ctx.destination);
+      g.gain.value = 0.06;
+      const now = ctx.currentTime;
+      o.start(now);
+      o.stop(now + dur);
+    } catch {}
+  }, [soundOn]);
+
+  // --- Visual palette ------------------------------------------------
+  const palette = useMemo(() => {
+    switch (theme) {
+      case "dusk":
+        return {
+          sky1: "#0b1026", sky2: "#2d2a61", sky3: "#ef476f",
+          pipe: "#5ce1e6", ground: "#372c2e", bird: "#ffd166", accent: "#06d6a0"
+        };
+      case "mint":
+        return {
+          sky1: "#021b1a", sky2: "#0f3d3e", sky3: "#6fffe9",
+          pipe: "#9cfffa", ground: "#123a3a", bird: "#f9f871", accent: "#caffbf"
+        };
+      default: // neon
+        return {
+          sky1: "#0b1220", sky2: "#101e4d", sky3: "#6cdefb",
+          pipe: "#7c3aed", ground: "#1f2937", bird: "#fbbf24", accent: "#22d3ee"
+        };
+    }
+  }, [theme]);
+
+  // --- Helpers -------------------------------------------------------
+  const resetGame = useCallback(() => {
+    birdRef.current = { y: H / 2, v: 0, rot: 0 };
+    pipesRef.current = [];
+    particlesRef.current = [];
+    setScore(0);
+    lastTimeRef.current = 0;
+    spawnRef.current = 0;
+    // clouds (parallax layers)
+    cloudsRef.current = Array.from({ length: 10 }).map(() => ({
+      x: Math.random() * W,
+      y: 40 + Math.random() * (H - GROUND_H - 260),
+      s: 0.2 + Math.random() * 1.2, // scale
+      v: 8 + Math.random() * 20 // velocity
+    }));
+  }, []);
+
+  const flap = useCallback(() => {
+    if (state === "ready") setState("playing");
+    if (state === "gameover") return;
+    birdRef.current.v = FLAP;
+    emitParticles(8, 1.2);
+    beep(1200, 0.05, "triangle");
+  }, [FLAP, state, beep]);
+
+  const pauseToggle = useCallback(() => {
+    if (state === "playing") setState("paused");
+    else if (state === "paused") setState("playing");
+  }, [state]);
+
+  const onKey = useCallback(
+    (e) => {
+      if (e.code === "Space") { e.preventDefault(); if (state !== "paused") flap(); }
+      else if (e.key.toLowerCase() === "p") pauseToggle();
+      else if (e.key.toLowerCase() === "r") { resetGame(); setState("ready"); }
+    },
+    [flap, pauseToggle, resetGame, state]
+  );
+
+  useEffect(() => { window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey); }, [onKey]);
+
+  const spawnPipe = useCallback(() => {
+    const margin = 70;
+    const gapY = Math.floor(margin + Math.random() * (H - GROUND_H - margin * 2 - PIPE_GAP));
+    pipesRef.current.push({ x: W + PIPE_W, gapY, passed: false });
+  }, [PIPE_GAP]);
+
+  const emitParticles = (n = 6, power = 1) => {
+    const by = birdRef.current.y;
+    for (let i = 0; i < n; i++) {
+      particlesRef.current.push({
+        x: BIRD_X - 10,
+        y: by + (Math.random() * 18 - 9),
+        vx: -60 - Math.random() * 80,
+        vy: (Math.random() - 0.5) * 140,
+        life: 0.6 + Math.random() * 0.4,
+        age: 0,
+        r: 2 + Math.random() * 3,
+      });
+    }
+  };
+
+  const collide = (y) => {
+    if (y - BIRD_R <= 0) return true;
+    if (y + BIRD_R >= H - GROUND_H) return true;
+    for (const p of pipesRef.current) {
+      const inX = BIRD_X + BIRD_R > p.x && BIRD_X - BIRD_R < p.x + PIPE_W;
+      if (inX) {
+        if (y - BIRD_R < p.gapY || y + BIRD_R > p.gapY + PIPE_GAP) return true;
+      }
+    }
+    return false;
+  };
+
+  const update = useCallback((t) => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext("2d"); if (!ctx) return;
+
+    if (lastTimeRef.current === 0) lastTimeRef.current = t;
+    const dt = Math.min(0.034, (t - lastTimeRef.current) / 1000);
+    lastTimeRef.current = t;
+
+    // --- BACKGROUND --------------------------------------------------
+    // Gradient sky with subtle vignette
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, palette.sky3);
+    grad.addColorStop(0.35, palette.sky2);
+    grad.addColorStop(1, palette.sky1);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Parallax clouds
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = "#ffffff";
+    for (const cl of cloudsRef.current) {
+      cl.x -= cl.v * dt;
+      if (cl.x < -140) cl.x = W + 80;
+      drawCloud(ctx, cl.x, cl.y, cl.s);
+    }
+    ctx.restore();
+
+    // Neon horizon glow
+    ctx.save();
+    const rad = ctx.createRadialGradient(W/2, H- GROUND_H - 40, 20, W/2, H- GROUND_H - 40, 360);
+    rad.addColorStop(0, palette.accent + "55");
+    rad.addColorStop(1, "#00000000");
+    ctx.fillStyle = rad;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+
+    // --- GAME SIM ----------------------------------------------------
+    if (state === "playing") {
+      // Bird physics
+      birdRef.current.v += GRAVITY * dt;
+      birdRef.current.y += birdRef.current.v * dt;
+      birdRef.current.rot = Math.max(-0.6, Math.min(0.9, birdRef.current.v / 520));
+
+      // Spawn pipes
+      spawnRef.current += dt * 1000;
+      if (spawnRef.current >= SPAWN_MS) { spawnRef.current = 0; spawnPipe(); }
+
+      // Move pipes & scoring
+      for (const p of pipesRef.current) {
+        p.x -= PIPE_SPEED * dt;
+        if (!p.passed && p.x + PIPE_W < BIRD_X - BIRD_R) {
+          p.passed = true; setScore((s) => s + 1); beep(660, 0.05, "square");
+        }
+      }
+      pipesRef.current = pipesRef.current.filter((p) => p.x + PIPE_W > -10);
+
+      // Particles
+      for (const pt of particlesRef.current) {
+        pt.age += dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vx *= 0.995; pt.vy += 600 * dt;
+      }
+      particlesRef.current = particlesRef.current.filter((p) => p.age < p.life);
+
+      // Collisions
+      if (collide(birdRef.current.y)) {
+        setState("gameover");
+        setBest((b) => { const nb = Math.max(b, score); localStorage.setItem("flappy-best", String(nb)); return nb; });
+        emitParticles(24, 2);
+        beep(120, 0.2, "sawtooth");
+      }
+    }
+
+    // --- DRAW FOREGROUND --------------------------------------------
+    // Pipes with gradient + shadow
+    for (const p of pipesRef.current) {
+      drawPipe(ctx, p.x, 0, PIPE_W, p.gapY, palette.pipe);
+      drawPipe(ctx, p.x, p.gapY + PIPE_GAP, PIPE_W, H - GROUND_H - (p.gapY + PIPE_GAP), palette.pipe);
+    }
+
+    // Ground (striped)
+    drawGround(ctx, W, H, GROUND_H, palette.ground);
+
+    // Bird (body + wing + subtle glow)
+    drawBird(ctx, BIRD_X, birdRef.current.y, BIRD_R, birdRef.current.rot, palette.bird);
+
+    // Particles
+    ctx.save();
+    for (const pt of particlesRef.current) {
+      const a = 1 - pt.age / pt.life;
+      ctx.globalAlpha = Math.max(0, a) * 0.8;
+      ctx.fillStyle = palette.accent;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // Loop
+    rafRef.current = requestAnimationFrame(update);
+  }, [GRAVITY, H, PIPE_GAP, PIPE_SPEED, SPAWN_MS, W, palette, state, beep, score, theme]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    canvas.width = W; canvas.height = H;
+
+    const onPointer = (e) => { e.preventDefault(); if (state === "paused") return; if (state === "ready") setState("playing"); flap(); };
+    canvas.addEventListener("pointerdown", onPointer, { passive: false });
+
+    rafRef.current = requestAnimationFrame(update);
+    return () => { cancelAnimationFrame(rafRef.current); canvas.removeEventListener("pointerdown", onPointer); };
+  }, [W, H, flap, update, state]);
+
+  useEffect(() => { if (state === "ready") resetGame(); }, [state, resetGame]);
+
+  // --- UI ------------------------------------------------------------
+  return (
+    <div className="w-full min-h-[860px] flex items-center justify-center bg-slate-950 p-6 relative overflow-hidden">
+      {/* Ambient gradient backdrop */}
+      <div className="pointer-events-none absolute inset-0">
+        <div className="absolute -top-32 -left-32 h-80 w-80 rounded-full blur-3xl opacity-40"
+             style={{ background: `radial-gradient( circle at center, ${palette.accent}, transparent 60%)` }} />
+        <div className="absolute -bottom-20 -right-20 h-96 w-96 rounded-full blur-3xl opacity-30"
+             style={{ background: `radial-gradient( circle at center, ${palette.pipe}, transparent 60%)` }} />
+      </div>
+
+      <div className="relative">
+        <div className="flex items-center justify-between mb-4">
+          <HUDChip icon={<Trophy className="w-4 h-4" />} label="Best" value={Math.max(best, score)} />
+          <div className="flex items-center gap-2">
+            <HUDChip icon={<Sparkles className="w-4 h-4" />} label="Score" value={score} emphasis />
+            <button
+              onClick={() => setSoundOn((s) => !s)}
+              className="px-3 py-2 rounded-xl bg-white/5 text-slate-200 hover:bg-white/10 border border-white/10 shadow-sm backdrop-blur transition"
+              aria-label="toggle sound"
+            >{soundOn ? <Volume2 className="w-4 h-4"/> : <VolumeX className="w-4 h-4"/>}</button>
+            <button
+              onClick={() => setTheme((t) => t === "neon" ? "dusk" : t === "dusk" ? "mint" : "neon")}
+              className="px-3 py-2 rounded-xl bg-white/5 text-slate-200 hover:bg-white/10 border border-white/10 shadow-sm backdrop-blur transition"
+              aria-label="cycle theme"
+            ><Settings className="w-4 h-4"/></button>
+          </div>
+        </div>
+
+        <div className="relative rounded-3xl shadow-2xl border border-white/10 overflow-hidden ring-1 ring-white/10">
+          <canvas ref={canvasRef} className="bg-black/40 block" style={{ touchAction: "none" }} />
+
+          {/* Overlay buttons */}
+          <div className="absolute left-3 top-3 flex items-center gap-2 z-10">
+            <button onClick={() => (state === "playing" ? setState("paused") : setState("playing"))}
+                    className="px-3 py-2 rounded-xl bg-white/5 text-slate-100 hover:bg-white/10 border border-white/10 shadow-sm backdrop-blur transition">
+              {state === "playing" ? <Pause className="w-4 h-4"/> : <Play className="w-4 h-4"/>}
+            </button>
+            <button onClick={() => { resetGame(); setState("ready"); }}
+                    className="px-3 py-2 rounded-xl bg-white/5 text-slate-100 hover:bg-white/10 border border-white/10 shadow-sm backdrop-blur transition">
+              <RotateCcw className="w-4 h-4"/>
+            </button>
+          </div>
+
+          {/* Bottom control bar */}
+          <div className="absolute bottom-0 left-0 right-0 p-3 bg-gradient-to-t from-black/60 to-transparent">
+            <div className="flex items-center gap-3">
+              <label className="text-slate-200 text-xs">Difficulty</label>
+              <input type="range" min="0.8" max="1.4" step="0.1" value={difficulty}
+                     onChange={(e) => setDifficulty(parseFloat(e.target.value))}
+                     className="w-40 accent-cyan-300" />
+              <div className="text-slate-300 text-xs tabular-nums">{difficulty.toFixed(1)}x</div>
+            </div>
+          </div>
+
+          {/* Modals */}
+          <AnimatePresence>
+            {(state === "ready") && (
+              <ModalCenter key="ready">
+                <motion.div initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.92, opacity: 0 }}
+                            className="mx-auto w-[86%] max-w-md rounded-2xl p-6 text-center bg-white/10 backdrop-blur-xl border border-white/15 shadow-2xl">
+                  <h1 className="text-2xl font-semibold text-white tracking-tight">Flappy Bird — Awe Edition</h1>
+                  <p className="text-slate-200/90 mt-2 text-sm">Click / Space to flap. Avoid pipes. Hit your flow.</p>
+                  <div className="mt-5 flex items-center justify-center gap-3">
+                    <button onClick={() => setState("playing")} className="px-4 py-2 rounded-xl bg-cyan-400/90 hover:bg-cyan-300 text-slate-900 font-medium shadow-lg shadow-cyan-500/20 transition">Play</button>
+                    <button onClick={() => { resetGame(); }} className="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-white border border-white/15 transition">Reset</button>
+                  </div>
+                  <p className="text-slate-300 mt-4 text-xs">P pause · R restart · Themes: {theme}</p>
+                </motion.div>
+              </ModalCenter>
+            )}
+
+            {(state === "paused") && (
+              <ModalCenter key="paused">
+                <motion.div initial={{ y: 20, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 20, opacity: 0 }}
+                            className="mx-auto w-[86%] max-w-md rounded-2xl p-6 text-center bg-white/10 backdrop-blur-xl border border-white/15 shadow-2xl">
+                  <h2 className="text-xl font-semibold text-white">Paused</h2>
+                  <p className="text-slate-200/90 mt-2 text-sm">Take a breath. When ready, continue your flight.</p>
+                  <div className="mt-5 flex items-center justify-center gap-3">
+                    <button onClick={() => setState("playing")} className="px-4 py-2 rounded-xl bg-cyan-400/90 hover:bg-cyan-300 text-slate-900 font-medium shadow-lg shadow-cyan-500/20 transition">Resume</button>
+                    <button onClick={() => { resetGame(); setState("ready"); }} className="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-white border border-white/15 transition">Menu</button>
+                  </div>
+                </motion.div>
+              </ModalCenter>
+            )}
+
+            {(state === "gameover") && (
+              <ModalCenter key="over">
+                <motion.div initial={{ y: -10, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: -10, opacity: 0 }}
+                            className="mx-auto w-[86%] max-w-md rounded-2xl p-6 text-center bg-white/10 backdrop-blur-xl border border-white/15 shadow-2xl">
+                  <h2 className="text-2xl font-semibold text-white">Game Over</h2>
+                  <div className="mt-4 grid grid-cols-2 gap-3">
+                    <StatCard label="Score" value={score} />
+                    <StatCard label="Best" value={Math.max(best, score)} />
+                  </div>
+                  <div className="mt-6 flex items-center justify-center gap-3">
+                    <button onClick={() => { resetGame(); setState("playing"); }} className="px-4 py-2 rounded-xl bg-cyan-400/90 hover:bg-cyan-300 text-slate-900 font-medium shadow-lg shadow-cyan-500/20 transition">Play Again</button>
+                    <button onClick={() => { resetGame(); setState("ready"); }} className="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-white border border-white/15 transition">Menu</button>
+                  </div>
+                </motion.div>
+              </ModalCenter>
+            )}
+          </AnimatePresence>
+        </div>
+
+        <div className="mt-3 text-center text-slate-400 text-xs select-none">React + Canvas · Parallax · Glass HUD · Local best saved</div>
+      </div>
+    </div>
+  );
+}
+
+// -------------------- UI Subcomponents ------------------------------
+function HUDChip({ icon, label, value, emphasis }) {
+  return (
+    <div className={`flex items-center gap-2 px-3 py-2 rounded-2xl backdrop-blur border shadow-sm ${
+      emphasis ? "bg-cyan-400/15 border-cyan-300/20 text-cyan-200" : "bg-white/5 border-white/10 text-slate-200"
+    }`}>
+      <div className="opacity-80">{icon}</div>
+      <div className="text-xs opacity-75">{label}</div>
+      <div className="text-sm font-semibold tabular-nums">{value}</div>
+    </div>
+  );
+}
+
+function ModalCenter({ children }) {
+  return (
+    <div className="absolute inset-0 flex items-center justify-center z-20">
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
+      <div className="relative z-10 w-full flex items-center justify-center px-6">{children}</div>
+    </div>
+  );
+}
+
+function StatCard({ label, value }) {
+  return (
+    <div className="rounded-xl p-4 bg-white/10 border border-white/15 text-white">
+      <div className="text-xs text-slate-200/80">{label}</div>
+      <div className="text-2xl font-semibold tabular-nums">{value}</div>
+    </div>
+  );
+}
+
+// -------------------- Drawing helpers -------------------------------
+function drawPipe(ctx, x, y, w, h, color) {
+  if (h <= 0) return;
+  ctx.save();
+  // shadow
+  ctx.shadowColor = color + "55";
+  ctx.shadowBlur = 16;
+  ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 6;
+  // body gradient
+  const grad = ctx.createLinearGradient(x, y, x + w, y);
+  grad.addColorStop(0, shade(color, -20));
+  grad.addColorStop(0.5, color);
+  grad.addColorStop(1, shade(color, 20));
+  ctx.fillStyle = grad;
+  roundRect(ctx, x, y, w, h, 10);
+  ctx.fill();
+  // lip
+  ctx.fillStyle = "#00000022";
+  ctx.fillRect(x - 1, y, w + 2, 8);
+  ctx.restore();
+}
+
+function drawGround(ctx, W, H, GROUND_H, color) {
+  ctx.save();
+  // base
+  const g = ctx.createLinearGradient(0, H - GROUND_H, 0, H);
+  g.addColorStop(0, shade(color, 10));
+  g.addColorStop(1, shade(color, -10));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, H - GROUND_H, W, GROUND_H);
+  // stripes
+  ctx.globalAlpha = 0.25;
+  ctx.fillStyle = "#ffffff";
+  for (let x = -40; x < W + 80; x += 36) {
+    ctx.fillRect(x, H - GROUND_H + 24, 24, 4);
+  }
+  ctx.restore();
+}
+
+function drawBird(ctx, x, y, r, rot, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rot);
+  // glow
+  const gl = ctx.createRadialGradient(0, 0, 4, 0, 0, r * 2.4);
+  gl.addColorStop(0, color + "aa");
+  gl.addColorStop(1, "#00000000");
+  ctx.fillStyle = gl;
+  ctx.beginPath(); ctx.arc(0, 0, r * 1.6, 0, Math.PI * 2); ctx.fill();
+  // body
+  const grad = ctx.createLinearGradient(-r, -r, r, r);
+  grad.addColorStop(0, shade(color, 20));
+  grad.addColorStop(1, shade(color, -10));
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+  // wing
+  ctx.fillStyle = "#ffffffcc";
+  ctx.beginPath(); ctx.ellipse(-2, 2, r * 0.8, r * 0.5, -0.5, 0, Math.PI * 2); ctx.fill();
+  // eye
+  ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(r * 0.35, -r * 0.35, 3, 0, Math.PI * 2); ctx.fill();
+  // beak
+  ctx.fillStyle = "#ff8c00"; ctx.beginPath(); ctx.moveTo(r, 0); ctx.lineTo(r + 12, -4); ctx.lineTo(r, 4); ctx.fill();
+  ctx.restore();
+}
+
+function drawCloud(ctx, x, y, s) {
+  ctx.beginPath();
+  ctx.ellipse(x, y, 38 * s, 22 * s, 0, 0, Math.PI * 2);
+  ctx.ellipse(x + 24 * s, y - 8 * s, 26 * s, 18 * s, 0, 0, Math.PI * 2);
+  ctx.ellipse(x - 26 * s, y - 6 * s, 22 * s, 16 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function shade(hex, amt) {
+  // simple hex shade util: amt -100..100
+  let c = hex.replace('#', '');
+  if (c.length === 3) c = c.split('').map(ch => ch + ch).join('');
+  const num = parseInt(c, 16);
+  let r = (num >> 16) + amt; r = Math.max(0, Math.min(255, r));
+  let g = ((num >> 8) & 0x00FF) + amt; g = Math.max(0, Math.min(255, g));
+  let b = (num & 0x0000FF) + amt; b = Math.max(0, Math.min(255, b));
+  return `#${(r<<16 | g<<8 | b).toString(16).padStart(6, '0')}`;
+}
